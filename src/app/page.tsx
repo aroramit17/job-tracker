@@ -4,8 +4,8 @@ import Link from 'next/link';
 
 export const dynamic = 'force-dynamic';
 
-export default function Dashboard() {
-  const jobs = getAllJobs();
+export default async function Dashboard() {
+  const jobs = await getAllJobs();
 
   return (
     <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8">

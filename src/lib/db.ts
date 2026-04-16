@@ -1,25 +1,23 @@
-import Database from 'better-sqlite3';
+import { createClient, type Client } from '@libsql/client';
 import { nanoid } from 'nanoid';
-import path from 'path';
-import fs from 'fs';
 import type { Job, CreateJobInput, UpdateJobInput } from './types';
 
-const DATA_DIR = path.join(process.cwd(), 'data');
-const DB_PATH = path.join(DATA_DIR, 'jobs.db');
+let client: Client | null = null;
 
-let db: Database.Database | null = null;
+function getClient(): Client {
+  if (client) return client;
+  client = createClient({
+    url: process.env.TURSO_DATABASE_URL!,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+  return client;
+}
 
-function getDb(): Database.Database {
-  if (db) return db;
+let initialized = false;
 
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-
-  db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
-
-  db.exec(`
+async function ensureTable(): Promise<void> {
+  if (initialized) return;
+  await getClient().execute(`
     CREATE TABLE IF NOT EXISTS jobs (
       id            TEXT PRIMARY KEY,
       linkedin_url  TEXT NOT NULL,
@@ -35,8 +33,7 @@ function getDb(): Database.Database {
       updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
-
-  return db;
+  initialized = true;
 }
 
 function rowToJob(row: Record<string, unknown>): Job {
@@ -56,42 +53,48 @@ function rowToJob(row: Record<string, unknown>): Job {
   };
 }
 
-export function getAllJobs(): Job[] {
-  const rows = getDb().prepare('SELECT * FROM jobs ORDER BY applied_date DESC').all();
-  return (rows as Record<string, unknown>[]).map(rowToJob);
+export async function getAllJobs(): Promise<Job[]> {
+  await ensureTable();
+  const result = await getClient().execute('SELECT * FROM jobs ORDER BY applied_date DESC');
+  return result.rows.map((row) => rowToJob(row as unknown as Record<string, unknown>));
 }
 
-export function getJobById(id: string): Job | null {
-  const row = getDb().prepare('SELECT * FROM jobs WHERE id = ?').get(id);
-  return row ? rowToJob(row as Record<string, unknown>) : null;
+export async function getJobById(id: string): Promise<Job | null> {
+  await ensureTable();
+  const result = await getClient().execute({ sql: 'SELECT * FROM jobs WHERE id = ?', args: [id] });
+  if (result.rows.length === 0) return null;
+  return rowToJob(result.rows[0] as unknown as Record<string, unknown>);
 }
 
-export function createJob(input: CreateJobInput): Job {
+export async function createJob(input: CreateJobInput): Promise<Job> {
+  await ensureTable();
   const id = nanoid();
   const now = new Date().toISOString();
 
-  getDb().prepare(`
-    INSERT INTO jobs (id, linkedin_url, title, company, salary_min, salary_max, salary_raw, status, applied_date, notes, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'applied', ?, ?, ?, ?)
-  `).run(
-    id,
-    input.linkedinUrl,
-    input.title,
-    input.company || '',
-    input.salaryMin,
-    input.salaryMax,
-    input.salaryRaw,
-    input.appliedDate,
-    input.notes || '',
-    now,
-    now,
-  );
+  await getClient().execute({
+    sql: `INSERT INTO jobs (id, linkedin_url, title, company, salary_min, salary_max, salary_raw, status, applied_date, notes, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'applied', ?, ?, ?, ?)`,
+    args: [
+      id,
+      input.linkedinUrl,
+      input.title,
+      input.company || '',
+      input.salaryMin,
+      input.salaryMax,
+      input.salaryRaw,
+      input.appliedDate,
+      input.notes || '',
+      now,
+      now,
+    ],
+  });
 
-  return getJobById(id)!;
+  return (await getJobById(id))!;
 }
 
-export function updateJob(id: string, input: UpdateJobInput): Job | null {
-  const existing = getJobById(id);
+export async function updateJob(id: string, input: UpdateJobInput): Promise<Job | null> {
+  await ensureTable();
+  const existing = await getJobById(id);
   if (!existing) return null;
 
   const fields: string[] = [];
@@ -111,11 +114,16 @@ export function updateJob(id: string, input: UpdateJobInput): Job | null {
   values.push(new Date().toISOString());
   values.push(id);
 
-  getDb().prepare(`UPDATE jobs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+  await getClient().execute({
+    sql: `UPDATE jobs SET ${fields.join(', ')} WHERE id = ?`,
+    args: values as any[],
+  });
+
   return getJobById(id);
 }
 
-export function deleteJob(id: string): boolean {
-  const result = getDb().prepare('DELETE FROM jobs WHERE id = ?').run(id);
-  return result.changes > 0;
+export async function deleteJob(id: string): Promise<boolean> {
+  await ensureTable();
+  const result = await getClient().execute({ sql: 'DELETE FROM jobs WHERE id = ?', args: [id] });
+  return result.rowsAffected > 0;
 }
