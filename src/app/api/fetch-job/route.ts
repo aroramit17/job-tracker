@@ -3,6 +3,7 @@ import { NextResponse } from 'next/server';
 const APIFY_TOKEN = process.env.APIFY_API_TOKEN;
 const ACTOR_ID = 'curious_coder~linkedin-jobs-scraper';
 
+// POST: start an actor run, return the run ID immediately
 export async function POST(request: Request) {
   const { url } = await request.json();
 
@@ -19,9 +20,8 @@ export async function POST(request: Request) {
   }
 
   try {
-    // Run the Apify actor synchronously and get the dataset items
     const runRes = await fetch(
-      `https://api.apify.com/v2/acts/${encodeURIComponent(ACTOR_ID)}/run-sync-get-dataset-items?token=${APIFY_TOKEN}`,
+      `https://api.apify.com/v2/acts/${encodeURIComponent(ACTOR_ID)}/runs?token=${APIFY_TOKEN}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -35,31 +35,83 @@ export async function POST(request: Request) {
 
     if (!runRes.ok) {
       const errText = await runRes.text();
-      console.error('Apify error:', runRes.status, errText);
+      console.error('Apify start error:', runRes.status, errText);
+      return NextResponse.json({ error: 'Failed to start scraper' }, { status: 502 });
+    }
+
+    const run = await runRes.json();
+    return NextResponse.json({ runId: run.data?.id });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    return NextResponse.json({ error: `Fetch failed: ${message}` }, { status: 502 });
+  }
+}
+
+// GET: poll for run status and return results when ready
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const runId = searchParams.get('runId');
+
+  if (!runId) {
+    return NextResponse.json({ error: 'runId is required' }, { status: 400 });
+  }
+
+  if (!APIFY_TOKEN) {
+    return NextResponse.json({ error: 'APIFY_API_TOKEN not configured' }, { status: 500 });
+  }
+
+  try {
+    // Check run status
+    const statusRes = await fetch(
+      `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
+    );
+
+    if (!statusRes.ok) {
+      return NextResponse.json({ error: 'Failed to check run status' }, { status: 502 });
+    }
+
+    const statusData = await statusRes.json();
+    const status = statusData.data?.status;
+
+    if (status === 'RUNNING' || status === 'READY') {
+      return NextResponse.json({ status: 'pending' });
+    }
+
+    if (status !== 'SUCCEEDED') {
       return NextResponse.json(
-        { error: `Scraper failed (status ${runRes.status})` },
+        { status: 'failed', error: `Scraper ${status?.toLowerCase() || 'failed'}` },
         { status: 502 }
       );
     }
 
-    const items = await runRes.json();
+    // Run succeeded — fetch dataset items
+    const datasetId = statusData.data?.defaultDatasetId;
+    const itemsRes = await fetch(
+      `https://api.apify.com/v2/datasets/${datasetId}/items?token=${APIFY_TOKEN}`
+    );
+
+    if (!itemsRes.ok) {
+      return NextResponse.json({ error: 'Failed to fetch results' }, { status: 502 });
+    }
+
+    const items = await itemsRes.json();
 
     if (!Array.isArray(items) || items.length === 0) {
       return NextResponse.json(
-        { error: 'No job data found at that URL' },
+        { status: 'done', error: 'No job data found at that URL' },
         { status: 404 }
       );
     }
 
     const job = items[0];
 
-    // Parse salary from the scraped data
     const salaryInfo = parseSalary(job.salary ?? job.salaryRange ?? job.compensation ?? '');
     const descriptionSalary = !salaryInfo && job.description
       ? parseSalaryFromText(job.description)
       : null;
 
-    const result = {
+    return NextResponse.json({
+      status: 'done',
       title: job.title ?? job.jobTitle ?? null,
       company: job.company ?? job.companyName ?? job.organization?.name ?? null,
       description: job.description ?? job.jobDescription ?? null,
@@ -67,20 +119,16 @@ export async function POST(request: Request) {
       salaryRaw: salaryInfo?.raw ?? descriptionSalary?.raw ?? job.salary ?? job.salaryRange ?? null,
       salaryMin: salaryInfo?.min ?? descriptionSalary?.min ?? null,
       salaryMax: salaryInfo?.max ?? descriptionSalary?.max ?? null,
-    };
-
-    return NextResponse.json(result);
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error';
-    console.error('Fetch job error:', message);
-    return NextResponse.json({ error: `Fetch failed: ${message}` }, { status: 502 });
+    return NextResponse.json({ error: `Poll failed: ${message}` }, { status: 502 });
   }
 }
 
 function parseSalary(text: string): { min: number; max: number; raw: string } | null {
   if (!text || text.trim().length === 0) return null;
 
-  // Range with K suffix: "$120K - $150K"
   const kRange = text.match(/\$([\d,]+(?:\.\d+)?)\s*[Kk]\s*(?:\/\s*(?:yr|year|hr|hour))?\s*[-–—to]+\s*\$([\d,]+(?:\.\d+)?)\s*[Kk]/);
   if (kRange) {
     return {
@@ -90,7 +138,6 @@ function parseSalary(text: string): { min: number; max: number; raw: string } | 
     };
   }
 
-  // Full number range: "$120,000 - $150,000"
   const fullRange = text.match(/\$([\d,]+)\s*(?:\/\s*(?:yr|year|hr|hour))?\s*[-–—to]+\s*\$([\d,]+)/);
   if (fullRange) {
     const min = parseInt(fullRange[1].replace(/,/g, ''));
@@ -100,14 +147,12 @@ function parseSalary(text: string): { min: number; max: number; raw: string } | 
     }
   }
 
-  // Single value with K: "$130K"
   const singleK = text.match(/\$([\d,]+(?:\.\d+)?)\s*[Kk]/);
   if (singleK) {
     const val = Math.round(parseFloat(singleK[1].replace(/,/g, '')) * 1000);
     return { min: val, max: val, raw: text.trim() };
   }
 
-  // Single full value: "$130,000"
   const single = text.match(/\$([\d,]+)/);
   if (single) {
     const val = parseInt(single[1].replace(/,/g, ''));
