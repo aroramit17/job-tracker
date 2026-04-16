@@ -43,49 +43,25 @@ export function AddJobForm() {
     setError('');
     setFetching(true);
     try {
-      // Step 1: Start the scraper run
-      const startRes = await fetch('/api/fetch-job', {
+      const res = await fetch('/api/fetch-job', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: linkedinUrl.trim() }),
       });
-      const startData = await startRes.json();
-      if (!startRes.ok || !startData.runId) {
-        setError(startData.error || 'Failed to start scraper');
-        setFetching(false);
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || 'Failed to fetch job details');
         return;
       }
-
-      // Step 2: Poll for results
-      const runId = startData.runId;
-      for (let i = 0; i < 30; i++) {
-        await new Promise((r) => setTimeout(r, 3000));
-        const pollRes = await fetch(`/api/fetch-job?runId=${runId}`);
-        const data = await pollRes.json();
-
-        if (data.status === 'pending') continue;
-
-        if (data.status === 'done' && !data.error) {
-          if (data.title) setTitle(data.title);
-          if (data.company) setCompany(data.company);
-          if (data.description) setDescription(data.description);
-          if (data.salaryRaw) {
-            setSalaryRaw(data.salaryRaw);
-            setSalaryMin(data.salaryMin);
-            setSalaryMax(data.salaryMax);
-          }
-          setParsed(true);
-          setFetching(false);
-          return;
-        }
-
-        // Failed or error
-        setError(data.error || 'Scraper failed');
-        setFetching(false);
-        return;
+      if (data.title) setTitle(data.title);
+      if (data.company) setCompany(data.company);
+      if (data.description) setDescription(data.description);
+      if (data.salaryRaw) {
+        setSalaryRaw(data.salaryRaw);
+        setSalaryMin(data.salaryMin);
+        setSalaryMax(data.salaryMax);
       }
-
-      setError('Scraper timed out — try pasting the description manually');
+      setParsed(true);
     } catch {
       setError('Network error fetching job details');
     } finally {
