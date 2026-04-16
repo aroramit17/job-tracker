@@ -7,8 +7,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'URL is required' }, { status: 400 });
   }
 
-  if (!url.includes('linkedin.com/jobs') && !url.includes('linkedin.com/job')) {
-    return NextResponse.json({ error: 'Please provide a valid LinkedIn job URL' }, { status: 400 });
+  try {
+    new URL(url);
+  } catch {
+    return NextResponse.json({ error: 'Invalid URL' }, { status: 400 });
   }
 
   try {
@@ -23,47 +25,33 @@ export async function POST(request: Request) {
 
     if (!res.ok) {
       return NextResponse.json(
-        { error: `LinkedIn returned status ${res.status}` },
+        { error: `Page returned status ${res.status}` },
         { status: 502 }
       );
     }
 
     const html = await res.text();
 
-    // Extract from LinkedIn's public job page HTML classes
-    const title = extractByClass(html, 'top-card-layout__title')
-      ?? extractMeta(html, 'og:title')?.replace(/\s*\|.*$/, '').replace(/\s*hiring\s+/, '');
+    // Try structured sources in order of reliability
+    const result = parseNextData(html)
+      ?? parseJsonLd(html)
+      ?? parseMetaTags(html);
 
-    const company = extractByClass(html, 'topcard__org-name-link')
-      ?? extractByClass(html, 'topcard__flavor')
-      ?? extractCompanyFromOg(html);
-
-    const location = extractByClass(html, 'topcard__flavor--bullet');
-
-    // Job description from the show-more-less section
-    const description = extractDescription(html);
-
-    // Salary
-    const salarySection = extractByClass(html, 'salary-main-rail__data-body')
-      ?? extractByClass(html, 'compensation__salary');
-    const salaryFromDesc = !salarySection && description ? parseSalaryFromText(description) : null;
-    const salaryParsed = salarySection ? parseSalaryFromText(salarySection) : null;
-
-    const result = {
-      title: title?.trim() ?? null,
-      company: company?.trim() ?? null,
-      description: description?.trim() ?? null,
-      location: location?.trim() ?? null,
-      salaryRaw: salaryParsed?.raw ?? salaryFromDesc?.raw ?? salarySection?.trim() ?? null,
-      salaryMin: salaryParsed?.min ?? salaryFromDesc?.min ?? null,
-      salaryMax: salaryParsed?.max ?? salaryFromDesc?.max ?? null,
-    };
-
-    if (!result.title && !result.company && !result.description) {
+    if (!result || (!result.title && !result.company && !result.description)) {
       return NextResponse.json(
         { error: 'Could not parse job details from that URL' },
         { status: 422 }
       );
+    }
+
+    // Try salary from description if not found elsewhere
+    if (!result.salaryRaw && result.description) {
+      const salary = parseSalaryFromText(result.description);
+      if (salary) {
+        result.salaryRaw = salary.raw;
+        result.salaryMin = salary.min;
+        result.salaryMax = salary.max;
+      }
     }
 
     return NextResponse.json(result);
@@ -73,16 +61,187 @@ export async function POST(request: Request) {
   }
 }
 
-function extractByClass(html: string, className: string): string | null {
-  const pattern = new RegExp(`${escapeRegex(className)}[^>]*>([^<]+)`, 'i');
-  const match = html.match(pattern);
-  return match ? decodeEntities(match[1].trim()) : null;
+interface JobResult {
+  title: string | null;
+  company: string | null;
+  description: string | null;
+  location: string | null;
+  salaryRaw: string | null;
+  salaryMin: number | null;
+  salaryMax: number | null;
+}
+
+// Parse __NEXT_DATA__ JSON (Rippling, Greenhouse, etc.)
+function parseNextData(html: string): JobResult | null {
+  const match = html.match(/__NEXT_DATA__[^>]*type="application\/json">([\s\S]*?)<\/script>/);
+  if (!match) return null;
+
+  try {
+    const data = JSON.parse(match[1]);
+    const pageProps = data?.props?.pageProps ?? {};
+
+    // Rippling ATS structure
+    const api = pageProps.apiData;
+    if (api?.jobPost) {
+      const jp = api.jobPost;
+      const pay = api.payRangeDetails?.[0];
+      let salaryRaw: string | null = null;
+      let salaryMin: number | null = null;
+      let salaryMax: number | null = null;
+
+      if (pay?.rangeStart != null) {
+        const min = pay.rangeStart as number;
+        const max = (pay.rangeEnd ?? pay.rangeStart) as number;
+        salaryMin = min;
+        salaryMax = max;
+        const sym = pay.currency === 'USD' ? '$' : (pay.currency ?? '$');
+        salaryRaw = min === max
+          ? `${sym}${min.toLocaleString()}`
+          : `${sym}${min.toLocaleString()} - ${sym}${max.toLocaleString()}`;
+        if (pay.frequency) salaryRaw += `/${pay.frequency.toLowerCase()}`;
+      }
+
+      return {
+        title: jp.name ?? null,
+        company: jp.companyName ?? api.jobBoard?.companyName ?? null,
+        description: extractText(jp.description) ?? null,
+        location: jp.workLocations?.[0]?.location ?? pay?.location ?? null,
+        salaryRaw,
+        salaryMin,
+        salaryMax,
+      };
+    }
+
+    // Greenhouse structure
+    const job = pageProps.job ?? pageProps.jobPosting;
+    if (job) {
+      return {
+        title: job.title ?? job.name ?? null,
+        company: job.company?.name ?? pageProps.company?.name ?? null,
+        description: typeof job.content === 'string' ? stripHtml(job.content) : (job.description ?? null),
+        location: job.location?.name ?? job.location ?? null,
+        salaryRaw: job.salary ?? job.pay ?? null,
+        salaryMin: null,
+        salaryMax: null,
+      };
+    }
+  } catch {
+    // Invalid JSON
+  }
+
+  return null;
+}
+
+// Parse JSON-LD JobPosting schema
+function parseJsonLd(html: string): JobResult | null {
+  const scriptPattern = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = scriptPattern.exec(html)) !== null) {
+    try {
+      const data = JSON.parse(match[1]);
+      const items = Array.isArray(data) ? data : [data];
+      for (const item of items) {
+        if (item['@type'] === 'JobPosting') {
+          let salaryRaw: string | null = null;
+          let salaryMin: number | null = null;
+          let salaryMax: number | null = null;
+
+          if (item.baseSalary?.value) {
+            const v = item.baseSalary.value;
+            salaryMin = v.minValue ?? v.value ?? null;
+            salaryMax = v.maxValue ?? v.value ?? null;
+            if (salaryMin != null) {
+              const sym = item.baseSalary.currency === 'USD' ? '$' : (item.baseSalary.currency ?? '$');
+              salaryRaw = salaryMin === salaryMax
+                ? `${sym}${salaryMin.toLocaleString()}`
+                : `${sym}${salaryMin!.toLocaleString()} - ${sym}${salaryMax!.toLocaleString()}`;
+            }
+          }
+
+          return {
+            title: item.title ?? null,
+            company: item.hiringOrganization?.name ?? null,
+            description: typeof item.description === 'string' ? stripHtml(item.description) : null,
+            location: item.jobLocation?.address?.addressLocality ?? null,
+            salaryRaw,
+            salaryMin,
+            salaryMax,
+          };
+        }
+      }
+    } catch {
+      // skip
+    }
+  }
+  return null;
+}
+
+// Fallback: parse OG meta tags + HTML
+function parseMetaTags(html: string): JobResult | null {
+  const ogTitle = extractMeta(html, 'og:title');
+  const ogDesc = extractMeta(html, 'og:description');
+  const pageTitle = html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]?.trim();
+
+  let title = ogTitle ?? pageTitle ?? null;
+  let company: string | null = null;
+
+  // Many ATS pages put "Title | Company" or "Title at Company" in og:title
+  if (title) {
+    title = decodeEntities(title).replace(/\s*\|\s*LinkedIn\s*$/i, '');
+    const pipeMatch = title.match(/^(.+?)\s*[|]\s*(.+)$/);
+    if (pipeMatch) {
+      title = pipeMatch[1].trim();
+      company = pipeMatch[2].trim();
+    } else {
+      const atMatch = title.match(/^(.+?)\s+at\s+(.+)$/i);
+      if (atMatch) {
+        title = atMatch[1].trim();
+        company = atMatch[2].trim();
+      }
+    }
+  }
+
+  // LinkedIn og:description: "Company · Location · Posted..."
+  if (!company && ogDesc) {
+    const dotMatch = ogDesc.match(/^(.+?)\s*·/);
+    if (dotMatch) company = dotMatch[1].trim();
+  }
+
+  // Try to get description from common HTML patterns
+  const description = extractDescription(html);
+
+  if (!title && !company && !description) return null;
+
+  return {
+    title,
+    company,
+    description: description ?? (ogDesc ? decodeEntities(ogDesc) : null),
+    location: null,
+    salaryRaw: null,
+    salaryMin: null,
+    salaryMax: null,
+  };
 }
 
 function extractDescription(html: string): string | null {
-  const match = html.match(/show-more-less-html__markup[^>]*>([\s\S]*?)<\/div/i);
-  if (!match) return null;
-  return stripHtml(match[1]).trim() || null;
+  // LinkedIn
+  const linkedin = html.match(/show-more-less-html__markup[^>]*>([\s\S]*?)<\/div/i);
+  if (linkedin) return stripHtml(linkedin[1]).trim() || null;
+
+  // Generic: look for a large content block with job-related classes
+  const patterns = [
+    /class="[^"]*job[_-]?description[^"]*"[^>]*>([\s\S]*?)<\/(?:div|section)/i,
+    /class="[^"]*description[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/(?:div|section)/i,
+    /id="[^"]*job[_-]?description[^"]*"[^>]*>([\s\S]*?)<\/(?:div|section)/i,
+  ];
+  for (const p of patterns) {
+    const m = html.match(p);
+    if (m) {
+      const text = stripHtml(m[1]).trim();
+      if (text.length > 50) return text;
+    }
+  }
+  return null;
 }
 
 function extractMeta(html: string, property: string): string | null {
@@ -93,16 +252,18 @@ function extractMeta(html: string, property: string): string | null {
   return m2 ? decodeEntities(m2[1]) : null;
 }
 
-function extractCompanyFromOg(html: string): string | null {
-  const desc = extractMeta(html, 'og:description');
-  if (!desc) return null;
-  // LinkedIn og:description often starts with "Company · Location"
-  const match = desc.match(/^(.+?)\s*·/);
-  return match ? match[1].trim() : null;
+function extractText(obj: unknown): string | null {
+  if (typeof obj === 'string') return stripHtml(obj);
+  if (obj && typeof obj === 'object') {
+    const o = obj as Record<string, unknown>;
+    if (typeof o.text === 'string') return stripHtml(o.text);
+    if (typeof o.html === 'string') return stripHtml(o.html);
+    if (typeof o.content === 'string') return stripHtml(o.content);
+  }
+  return null;
 }
 
 function parseSalaryFromText(text: string): { min: number; max: number; raw: string } | null {
-  // Range with K suffix: "$120K - $150K"
   const kRange = text.match(/\$([\d,]+(?:\.\d+)?)\s*[Kk]\s*(?:\/\s*(?:yr|year|hr|hour))?\s*[-–—to]+\s*\$([\d,]+(?:\.\d+)?)\s*[Kk]/);
   if (kRange) {
     return {
@@ -112,7 +273,6 @@ function parseSalaryFromText(text: string): { min: number; max: number; raw: str
     };
   }
 
-  // Full number range: "$120,000 - $150,000"
   const fullRange = text.match(/\$([\d,]+)\s*(?:\/\s*(?:yr|year|hr|hour))?\s*[-–—to]+\s*\$([\d,]+)/);
   if (fullRange) {
     const min = parseInt(fullRange[1].replace(/,/g, ''));
@@ -122,14 +282,12 @@ function parseSalaryFromText(text: string): { min: number; max: number; raw: str
     }
   }
 
-  // Single value with K: "$130K"
   const singleK = text.match(/\$([\d,]+(?:\.\d+)?)\s*[Kk]/);
   if (singleK) {
     const val = Math.round(parseFloat(singleK[1].replace(/,/g, '')) * 1000);
     return { min: val, max: val, raw: singleK[0].trim() };
   }
 
-  // Single full value: "$130,000"
   const single = text.match(/\$([\d,]+)/);
   if (single) {
     const val = parseInt(single[1].replace(/,/g, ''));
@@ -160,7 +318,8 @@ function decodeEntities(text: string): string {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, '/');
+    .replace(/&#x2F;/g, '/')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
 function escapeRegex(str: string): string {

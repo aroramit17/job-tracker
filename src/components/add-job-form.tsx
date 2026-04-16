@@ -128,13 +128,13 @@ export function AddJobForm() {
       )}
 
       <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">LinkedIn Job URL</label>
+        <label className="block text-sm font-medium text-gray-700 mb-1">Job Listing URL</label>
         <div className="flex gap-2">
           <input
             type="url"
             value={linkedinUrl}
             onChange={(e) => setLinkedinUrl(e.target.value)}
-            placeholder="https://www.linkedin.com/jobs/view/..."
+            placeholder="https://ats.rippling.com/... or any job listing URL"
             className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900 focus:border-transparent"
           />
           <button
